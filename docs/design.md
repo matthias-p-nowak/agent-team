@@ -8,13 +8,17 @@ Record the objective in `runner/notes.md` before launch. The leader keeps its pr
 
 `work/` is the root of the project being implemented. Start worker calls there, keep deliverables and generated files there, and give workers project paths relative to that directory. Workers can read task specifications elsewhere in the checkout for context. The leader and model discovery run from the repository root.
 
+By default, the worker project's canonical `requests.md`, `design.md`, `architecture.md`, and `issues.md` live in `work/docs/`. Follow any project-local override.
+
 Before each leader call, clear `runner/next.txt` and refresh `runner/team.txt` with `pi --list-models`. The table begins with a header and each model row starts with its provider and model. The leader chooses the worker and prompt, then writes exactly three lines to `runner/next.txt` in this order:
 
 1. Prompt file path relative to the repository root, outside `runner/`.
 2. Provider from `runner/team.txt`.
 3. Model from `runner/team.txt`.
 
-The leader can instead write `stop` on one line. Before stopping, the leader prints a user-facing outcome or, when a user decision blocks progress, one question with options. The runner relays that output.
+The leader can instead write `stop` on one line. Before stopping, the leader prints a user-facing outcome or, when a user decision blocks progress, one question with options.
+
+The runner streams assistant response text during model calls and relays stdout from model discovery. Pi diagnostics go to stderr and appear in red when connected to a terminal and `NO_COLOR` is unset or empty.
 
 ## Model qualification and termination
 

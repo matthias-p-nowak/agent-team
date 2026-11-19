@@ -2,15 +2,18 @@
 """Run alternating Pi leader and worker calls from the repository root."""
 
 import argparse
+import codecs
 import fcntl
 import json
 import os
 from pathlib import Path
 import re
+import selectors
 import signal
 import subprocess
 import sys
 from tempfile import NamedTemporaryFile
+import time
 from urllib.parse import urlencode, urlsplit, urlunsplit
 from urllib.request import Request, urlopen
 
@@ -58,16 +61,109 @@ def model_key(model: Model) -> str:
     return "/".join(model)
 
 
-def run_pi(*arguments, cwd=ROOT):
+class ModelOutput:
+    """Render Pi's newline-delimited events as assistant text and track its final error."""
+
+    def __init__(self):
+        self.pending = []
+        self.text_started = False
+        self.error = None
+
+    def feed(self, text, *, final):
+        """Yield display text from complete events, including an unterminated final line."""
+        *lines, tail = text.split("\n")
+        if final:
+            lines.append(tail)
+        for line in lines:
+            self.pending.append(line)
+            record = "".join(self.pending)
+            self.pending.clear()
+            if record:
+                yield self.render_event(record)
+        if not final and tail:
+            self.pending.append(tail)
+
+    def render_event(self, record):
+        """Extract response text and preserve the failure semantics of Pi's text mode."""
+        try:
+            event = json.loads(record)
+        except json.JSONDecodeError:
+            return record + "\n"
+        if not isinstance(event, dict):
+            return record + "\n"
+        if event.get("type") == "message_update":
+            update = event["assistantMessageEvent"]
+            if update["type"] == "text_delta":
+                self.text_started = True
+                return update["delta"]
+        if event.get("type") == "message_end" and event["message"].get("role") == "assistant":
+            message = event["message"]
+            stop_reason = message.get("stopReason")
+            self.error = None
+            if stop_reason in ("error", "aborted"):
+                self.error = message.get("errorMessage") or f"Request {stop_reason}"
+            elif stop_reason == "length":
+                self.error = "Response was truncated: the model reached its output token limit."
+            if self.text_started:
+                self.text_started = False
+                return "\n"
+        return ""
+
+
+def relay_output(destination, text, *, red):
+    """Flush visible output and reset terminal color after each stderr write."""
+    destination.write(f"\x1b[31m{text}\x1b[0m" if red else text)
+    destination.flush()
+
+
+def stream_pi_output(process, command, model_output):
+    """Relay both Pi pipes as data arrives and capture their text before the deadline."""
+    deadline = time.monotonic() + PI_TIMEOUT
+    stdout, stderr = [], []
+    red_stderr = sys.stderr.isatty() and not os.environ.get("NO_COLOR")
+    with selectors.DefaultSelector() as selector:
+        for pipe, destination, chunks, red, events in (
+            (process.stdout, sys.stdout, stdout, False, model_output),
+            (process.stderr, sys.stderr, stderr, red_stderr, None),
+        ):
+            decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+            selector.register(pipe, selectors.EVENT_READ, (destination, chunks, red, decoder, events))
+
+        while selector.get_map():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise subprocess.TimeoutExpired(command, PI_TIMEOUT)
+            for key, _ in selector.select(remaining):
+                destination, chunks, red, decoder, events = key.data
+                data = os.read(key.fd, 4096)
+                text = decoder.decode(data, final=not data)
+                visible = "".join(events.feed(text, final=not data)) if events else text
+                if visible:
+                    chunks.append(visible)
+                    relay_output(destination, visible, red=red)
+                if not data:
+                    selector.unregister(key.fileobj)
+
+    process.wait(timeout=max(0, deadline - time.monotonic()))
+    returncode = process.returncode
+    if model_output and model_output.error:
+        error = model_output.error + "\n"
+        stderr.append(error)
+        relay_output(sys.stderr, error, red=red_stderr)
+        returncode = returncode or 1
+    return subprocess.CompletedProcess(command, returncode, "".join(stdout), "".join(stderr))
+
+
+def run_pi(*arguments, cwd=ROOT, model_events=False):
     """Run Pi with a deadline and clean up its process group on interruption."""
     command = ["pi", *arguments]
     with subprocess.Popen(
         command, cwd=cwd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE, encoding="utf-8", errors="replace", start_new_session=True,
+        stderr=subprocess.PIPE, start_new_session=True,
     ) as process:
         try:
-            stdout, stderr = process.communicate(timeout=PI_TIMEOUT)
-        except (subprocess.TimeoutExpired, KeyboardInterrupt):
+            return stream_pi_output(process, command, ModelOutput() if model_events else None)
+        except (subprocess.TimeoutExpired, KeyboardInterrupt, OSError):
             # Let Pi clean up its own tool processes, then kill any remaining group members.
             try:
                 os.killpg(process.pid, signal.SIGTERM)
@@ -82,7 +178,6 @@ def run_pi(*arguments, cwd=ROOT):
                     pass
                 process.wait()
             raise
-        return subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
 
 
 def refresh_team(memory):
@@ -92,7 +187,7 @@ def refresh_team(memory):
     except subprocess.TimeoutExpired as error:
         raise RuntimeError(f"pi --list-models timed out after {PI_TIMEOUT} seconds") from error
     if result.returncode:
-        raise RuntimeError(f"pi --list-models exited with {result.returncode}: {result.stderr.strip()}")
+        raise RuntimeError(f"pi --list-models exited with {result.returncode}")
 
     rows = iter(result.stdout.splitlines(keepends=True))
     for header in rows:
@@ -160,23 +255,25 @@ def run_model(model, prompt, memory, *, cwd=ROOT):
     prompt_path = os.path.relpath(ROOT / prompt, cwd)
     error_output = ""
     try:
-        result = run_pi("--no-session", "--provider", provider, "--model", name, "-p", f"@{prompt_path}", cwd=cwd)
+        result = run_pi(
+            "--no-session", "--provider", provider, "--model", name, "--mode", "json", "-p", f"@{prompt_path}",
+            cwd=cwd, model_events=True,
+        )
     except subprocess.TimeoutExpired:
         reason = f"Pi timed out after {PI_TIMEOUT} seconds"
     else:
         if result.returncode == 0:
-            return result.stdout
+            return True
         error_output = result.stderr.strip() or result.stdout.strip()
         reason = f"Pi exited with {result.returncode}"
-        if error_output:
-            reason += f": {error_output}"
 
-    memory[model_key(model)].update(leader="disqualified", worker="failed", disqualification_reason=reason)
+    detail = f"{reason}: {error_output}" if error_output else reason
+    memory[model_key(model)].update(leader="disqualified", worker="failed", disqualification_reason=detail)
     save_memory(memory)
     log(f"Disqualified {model_key(model)}: {reason}")
     if error_output:
         delete_failed_model(model, error_output)
-    return None
+    return False
 
 
 def file_snapshot(path):
@@ -238,8 +335,7 @@ def run_rounds(max_rounds, preferred):
         before_notes = file_snapshot(NOTES)
         before_assignment = file_snapshot(ASSIGNMENT)
         log(f"Round {round_number}/{max_rounds}, leader {model_key(leader)}")
-        output = run_model(leader, LEADER_PROMPT, memory)
-        if output is None:
+        if not run_model(leader, LEADER_PROMPT, memory):
             continue
 
         leader_record = memory[model_key(leader)]
@@ -261,15 +357,13 @@ def run_rounds(max_rounds, preferred):
         leader_record["leader"] = "works"
         save_memory(memory)
         if handoff is None:
-            if output.strip():
-                print(output.rstrip(), flush=True)
             return 0
 
         preferred = leader
         prompt, worker = handoff
         REPORT.unlink(missing_ok=True)
         log(f"Round {round_number}/{max_rounds}, worker {model_key(worker)} using {prompt}")
-        if run_model(worker, prompt, memory, cwd=WORK) is None:
+        if not run_model(worker, prompt, memory, cwd=WORK):
             continue
         worker_record = memory[model_key(worker)]
         report = file_snapshot(REPORT)
