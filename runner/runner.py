@@ -5,6 +5,8 @@ import argparse
 import codecs
 import fcntl
 import json
+import logging
+from logging.handlers import RotatingFileHandler
 import os
 from pathlib import Path
 import re
@@ -13,6 +15,7 @@ import signal
 import subprocess
 import sys
 from tempfile import NamedTemporaryFile
+from textwrap import indent
 import time
 from urllib.parse import urlencode, urlsplit, urlunsplit
 from urllib.request import Request, urlopen
@@ -21,6 +24,7 @@ from urllib.request import Request, urlopen
 # Anchor all control files and subprocesses to this checkout.
 ROOT = Path(__file__).resolve().parent.parent
 RUNNER = ROOT / "runner"
+LOG_PATH = RUNNER / "runner.log"
 WORK = ROOT / "work"
 MEMORY = RUNNER / "memory.json"
 TEAM = RUNNER / "team.txt"
@@ -30,12 +34,20 @@ ASSIGNMENT = WORK / "assignment.md"
 REPORT = WORK / "report.md"
 LEADER_PROMPT = "prompts/leader.md"
 PI_TIMEOUT = 3600
+PI_PROGRESS_INTERVAL = 30  # Seconds between status lines when a model call is quiet.
+TOOL_ARGS_LIMIT = 2000  # Characters shown for tool arguments or the Bash command.
+TOOL_OUTPUT_LIMIT = 4096  # Characters shown from the end of a tool result.
 DEFAULT_MAX_ROUNDS = 20
 Model = tuple[str, str]  # Provider and exact model ID as listed by Pi.
+LOGGER = logging.getLogger("pi_runner")
+LOGGER.setLevel(logging.INFO)
+LOGGER.propagate = False
+LOGGER.addHandler(logging.NullHandler())
 
 
 def log(message):
-    """Emit runner diagnostics separately from the leader's user-facing output."""
+    """Write runner diagnostics to stderr and the local log."""
+    LOGGER.info("%s", message)
     print(message, file=sys.stderr, flush=True)
 
 
@@ -61,13 +73,57 @@ def model_key(model: Model) -> str:
     return "/".join(model)
 
 
+def tool_preview(text, limit, *, tail=False):
+    """Bound tool details and display control characters literally."""
+    if len(text) > limit:
+        text = f"[Earlier output omitted]\n{text[-limit:]}" if tail else f"{text[:limit]} [truncated]"
+    return "".join(char if char.isprintable() or char in "\n\t" else ascii(char)[1:-1] for char in text)
+
+
 class ModelOutput:
-    """Render Pi's newline-delimited events as assistant text and track its final error."""
+    """Render Pi's event stream as response text and progress, and track its final error."""
 
     def __init__(self):
         self.pending = []
         self.text_started = False
+        self.thinking = False
+        self.stop_reason = None
         self.error = None
+        self.last_output = time.monotonic()
+
+    def progress(self, message):
+        """Show runner progress and restart the quiet period."""
+        log(message)
+        self.last_output = time.monotonic()
+
+    def tool_started(self, event):
+        """Report a tool's resolved arguments when it begins executing."""
+        name = event["toolName"]
+        args = event.get("args", {})
+        if name == "bash" and isinstance(args, dict) and isinstance(args.get("command"), str):
+            timeout = args.get("timeout")
+            timeout_label = f" (timeout {timeout}s)" if isinstance(timeout, (int, float)) else ""
+            command = indent("$ " + tool_preview(args["command"], TOOL_ARGS_LIMIT), "  ")
+            self.progress(f"Pi is running bash{timeout_label}\n{command}")
+        else:
+            preview = tool_preview(json.dumps(args, ensure_ascii=False), TOOL_ARGS_LIMIT)
+            self.progress(f"Pi is running tool {name} {preview}")
+
+    def tool_finished(self, event):
+        """Report tool status and show the result of Bash calls and failed tools."""
+        name = event["toolName"]
+        result = event.get("result") or {}
+        status = "failed" if event.get("isError") else "finished"
+        exit_code = (result.get("structuredContent") or {}).get("exit_code") if name == "bash" else None
+        exit_label = f" (exit {exit_code})" if isinstance(exit_code, int) else ""
+        duration = event.get("durationMs")
+        duration_label = f" in {duration / 1000:.2f}s" if isinstance(duration, (int, float)) else ""
+        message = f"Pi tool {name} {status}{exit_label}{duration_label}"
+        if name == "bash" or event.get("isError"):
+            output = "\n".join(block["text"] for block in result.get("content", []) if block["type"] == "text")
+            if output:
+                message += "\n" + indent(tool_preview(output.rstrip("\n"), TOOL_OUTPUT_LIMIT, tail=True), "  ")
+        self.progress(message)
 
     def feed(self, text, *, final):
         """Yield display text from complete events, including an unterminated final line."""
@@ -91,22 +147,43 @@ class ModelOutput:
             return record + "\n"
         if not isinstance(event, dict):
             return record + "\n"
-        if event.get("type") == "message_update":
+        event_type = event.get("type")
+        if event_type == "message_update":
             update = event["assistantMessageEvent"]
-            if update["type"] == "text_delta":
+            update_type = update["type"]
+            if update_type == "text_delta" and update["delta"]:
                 self.text_started = True
                 return update["delta"]
-        if event.get("type") == "message_end" and event["message"].get("role") == "assistant":
+            if update_type in ("thinking_start", "thinking_delta") and not self.thinking:
+                self.thinking = True
+                self.progress("Pi is thinking...")
+            elif update_type == "thinking_end":
+                self.thinking = False
+            elif update_type == "toolcall_start":
+                name = update.get("toolName")
+                self.progress(f"Pi is preparing tool {name}..." if name else "Pi is preparing a tool call...")
+        elif event_type == "tool_execution_start":
+            self.tool_started(event)
+        elif event_type == "tool_execution_end":
+            self.tool_finished(event)
+        elif event_type == "message_end" and event["message"].get("role") == "assistant":
             message = event["message"]
+            self.thinking = False
             stop_reason = message.get("stopReason")
+            self.stop_reason = stop_reason
+            text = "\n" if self.text_started else "".join(
+                block["text"] + "\n" for block in message.get("content", [])
+                if block["type"] == "text" and block["text"]
+            )
+            self.text_started = False
             self.error = None
             if stop_reason in ("error", "aborted"):
                 self.error = message.get("errorMessage") or f"Request {stop_reason}"
             elif stop_reason == "length":
                 self.error = "Response was truncated: the model reached its output token limit."
-            if self.text_started:
-                self.text_started = False
-                return "\n"
+                if not text:
+                    self.error += " Pi returned no answer text in that response."
+            return text
         return ""
 
 
@@ -116,9 +193,10 @@ def relay_output(destination, text, *, red):
     destination.flush()
 
 
-def stream_pi_output(process, command, model_output):
-    """Relay both Pi pipes as data arrives and capture their text before the deadline."""
-    deadline = time.monotonic() + PI_TIMEOUT
+def stream_pi_output(process, command, model_output, *, display):
+    """Capture both Pi pipes before the deadline and optionally relay them as data arrives."""
+    started = time.monotonic()
+    deadline = started + PI_TIMEOUT
     stdout, stderr = [], []
     red_stderr = sys.stderr.isatty() and not os.environ.get("NO_COLOR")
     with selectors.DefaultSelector() as selector:
@@ -133,14 +211,26 @@ def stream_pi_output(process, command, model_output):
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise subprocess.TimeoutExpired(command, PI_TIMEOUT)
+            if model_output:
+                until_status = model_output.last_output + PI_PROGRESS_INTERVAL - time.monotonic()
+                if until_status <= 0:
+                    model_output.progress("Pi is still running...")
+                    until_status = PI_PROGRESS_INTERVAL
+                remaining = min(remaining, until_status)
             for key, _ in selector.select(remaining):
                 destination, chunks, red, decoder, events = key.data
                 data = os.read(key.fd, 4096)
                 text = decoder.decode(data, final=not data)
-                visible = "".join(events.feed(text, final=not data)) if events else text
-                if visible:
-                    chunks.append(visible)
-                    relay_output(destination, visible, red=red)
+                rendered = events.feed(text, final=not data) if events else (text,)
+                for visible in rendered:
+                    if visible:
+                        chunks.append(visible)
+                        if destination is sys.stderr:
+                            LOGGER.warning("Pi stderr: %s", visible.rstrip("\n"))
+                        if display:
+                            relay_output(destination, visible, red=red)
+                        if model_output:
+                            model_output.last_output = time.monotonic()
                 if not data:
                     selector.unregister(key.fileobj)
 
@@ -149,12 +239,19 @@ def stream_pi_output(process, command, model_output):
     if model_output and model_output.error:
         error = model_output.error + "\n"
         stderr.append(error)
+        LOGGER.warning("Pi model error: %s", model_output.error)
         relay_output(sys.stderr, error, red=red_stderr)
         returncode = returncode or 1
-    return subprocess.CompletedProcess(command, returncode, "".join(stdout), "".join(stderr))
+    output = "".join(stdout)
+    if model_output:
+        LOGGER.info(
+            "Pi finished in %.1fs (process_exit=%d, status=%d, stop_reason=%s, stdout_chars=%d)",
+            time.monotonic() - started, process.returncode, returncode, model_output.stop_reason, len(output),
+        )
+    return subprocess.CompletedProcess(command, returncode, output, "".join(stderr))
 
 
-def run_pi(*arguments, cwd=ROOT, model_events=False):
+def run_pi(*arguments, cwd=ROOT, model_events=False, display=True):
     """Run Pi with a deadline and clean up its process group on interruption."""
     command = ["pi", *arguments]
     with subprocess.Popen(
@@ -162,7 +259,7 @@ def run_pi(*arguments, cwd=ROOT, model_events=False):
         stderr=subprocess.PIPE, start_new_session=True,
     ) as process:
         try:
-            return stream_pi_output(process, command, ModelOutput() if model_events else None)
+            return stream_pi_output(process, command, ModelOutput() if model_events else None, display=display)
         except (subprocess.TimeoutExpired, KeyboardInterrupt, OSError):
             # Let Pi clean up its own tool processes, then kill any remaining group members.
             try:
@@ -183,7 +280,7 @@ def run_pi(*arguments, cwd=ROOT, model_events=False):
 def refresh_team(memory):
     """Refresh the team's model table and register any newly discovered models."""
     try:
-        result = run_pi("--list-models")
+        result = run_pi("--list-models", display=False)
     except subprocess.TimeoutExpired as error:
         raise RuntimeError(f"pi --list-models timed out after {PI_TIMEOUT} seconds") from error
     if result.returncode:
@@ -390,23 +487,40 @@ def main():
         parser.error("--max-rounds must be at least 1")
     preferred = (args.leader[0], args.leader[1]) if args.leader else None
 
+    lock = None
+    log_handler = None
     try:
         # Lock the runner directory without adding a persistent lock file.
         lock = os.open(RUNNER, os.O_RDONLY | os.O_DIRECTORY)
         try:
-            try:
-                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except BlockingIOError:
-                raise RuntimeError("another runner is active in this workspace") from None
-            return run_rounds(args.max_rounds, preferred)
-        finally:
-            os.close(lock)
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise RuntimeError("another runner is active in this workspace") from None
+
+        log_handler = RotatingFileHandler(LOG_PATH, maxBytes=1024 * 1024, backupCount=2, encoding="utf-8")
+        formatter = logging.Formatter("%(asctime)s %(levelname)s %(message)s", datefmt="%Y-%m-%dT%H:%M:%SZ")
+        formatter.converter = time.gmtime
+        log_handler.setFormatter(formatter)
+        LOGGER.addHandler(log_handler)
+        LOGGER.info("Runner started (pid=%d, max_rounds=%d, preferred=%s)", os.getpid(), args.max_rounds, preferred)
+        status = run_rounds(args.max_rounds, preferred)
+        LOGGER.info("Runner exited with status %d", status)
+        return status
     except KeyboardInterrupt:
         log("Runner interrupted.")
         return 130
     except (OSError, RuntimeError, ValueError) as error:
         log(f"Runner error: {error}")
         return 1
+    except Exception:
+        LOGGER.exception("Unexpected runner error")
+        raise
+    finally:
+        if log_handler is not None:
+            LOGGER.removeHandler(log_handler)
+            log_handler.close()
+        if lock is not None:
+            os.close(lock)
 
 
 if __name__ == "__main__":
