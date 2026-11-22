@@ -15,7 +15,7 @@
     - assistant text (`text_delta`) in the terminal's default foreground (white on dark, black on light screens)
     - thinking deltas in gray (ANSI bright black, readable on dark and light backgrounds)
     - stderr in red
-    - tool calls in blue using pi's json output: start with tool name and shortened arguments, end with error flag
+    - tool calls in blue using pi's json output: start with tool name and shortened arguments; a tool end is shown only when it failed: `Tool error: <tool> <target>: <error text>`, the target (path or command) matched via the tool call id, the error text shortened to 200 characters
 - output from runner in green, and with timestamps
 - no colors when stdout is not a TTY or `NO_COLOR` is set
 - only the terminal's default foreground is used for the main text, so no inversion is needed for black-on-white screens
@@ -48,10 +48,12 @@
     - if `task/next.md` is missing, empty, or already marked done, the leader only writes `suggestion.md` and stops without assigning work
 
 # Before each leader call
-- runs `pi --list-models` and fills `<cwd>/team.txt`, but skips line 1 - no output to stdout
-    - each row starts with provider and model
+- runs `pi --list-models` and fills `<cwd>/team.txt`, keeping the header row (line 1) so the columns are labelled - no output to stdout
+    - each row starts with a model id, followed by Pi's provider and model columns; the header row gets an `id` column
+    - model id: first 6 hex characters of sha256 of `<provider> <model>`, lowercase; stable across runs; if two eligible models share an id, all ids in that `team.txt` use 8 characters
     - discovery output is a whitespace-separated table with a header followed by model rows; the first two columns are provider and model
-- remove `<cwd>/next.txt` immediately before every leader call
+- remove `<cwd>/next.txt` (and a misplaced `<cwd>/prompts/next.txt`) immediately before every leader call
+- a handover written to `prompts/next.txt` is not accepted; the disqualification reason says it was written in the wrong directory
 - randomly select a leader for the next leader call
 - call leader
 
@@ -70,15 +72,16 @@
 # Handover
 - leader write `next.txt` in current working directory
     - first line: `<prompt file>`, or 'stop' or 'disqualify'
-    - second line: provider 
-    - third line: model
-- runner picks up `next.txt` and calls that model from that provider with that prompt
+    - second line: model id from `team.txt`
+- runner picks up `next.txt`, maps the id to provider and model, and calls that model with that prompt; logs and `runner.json` always use the full provider and model
 - leader should disqualify models when they do not follow assignments
+- the leader plans, assigns and assesses but does not implement; it only writes `notes.md`, `features.md`, `assignment.md`, `suggestion.md` and `next.txt`
 - `stop` is a single-line handover; before writing it, the leader writes `suggestion.md` (see Task) and updates `features.md`
-- `disqualify` uses the provider and model on lines 2 and 3 to identify the model; the leader records its reason in `notes.md`, and the runner records that the leader disqualified the model in `runner.json`
-- for a worker handover, line 1 names a file inside `prompts/`, relative to the current working directory; provider and model must appear together in `team.txt`
+- `disqualify` uses the model id on line 2 to identify the model; the leader records its reason in `notes.md`, and the runner records that the leader disqualified the model in `runner.json`
+- for a worker handover, line 1 names a file inside `prompts/`, relative to the current working directory; the id must appear in `team.txt`
+- id parsing is lenient: case-insensitive; surrounding quotes, backticks and a leading label word (`id`, `model`, optionally with `:` or `=`) are ignored
 - strip leading and trailing whitespace from each handover line; accept LF, CR, and CRLF line endings
-- extra lines or missing required fields disqualify the leader
+- trailing blank lines are ignored; other extra lines or missing required fields disqualify the leader
 
 # Loop
 - one leader is kept for the whole feature
@@ -101,14 +104,17 @@
 - with timestamps
 - contains runner messages, Pi commands, exit codes, errors and tool events; not the streamed assistant or thinking text
 - appended, no rotation
+- each invocation starts with a clearly visible `RUN START` line (PID, working directory, arguments), followed by the effective settings
 
 # Models that get disqualified
 - cannot be loaded -> log error message from server
+    - a call failing with "model … is not running" (llama.cpp router has the model unloaded) is not a failure yet: the runner sends `POST <server>/models/load` with `{"model": "<model>"}`, polls `GET <server>/models` every 10 s until the model reports `loaded` or a failed status, for up to 10 minutes (slow disks such as USB; bounded by the run deadline), and then retries the call once; if the retry still reports "is not running", it counts as a load failure (disqualify + remove)
 - got a timeout -> log "timed out"
 - other Pi errors (`stopReason: error`, nonzero exit) that are not a recognised load failure -> disqualify with the error message or exit code as reason, but do not remove
     - malformed JSON lines are not fatal: print them in gray and log them
 - was a leader and did not write `next.txt`
-- wrote non-existing prompt/provider/model into `next.txt`
+- was a worker that did no work: no tool call and `report.md` unchanged -> reason "did no work"
+- wrote a non-existing prompt or model id into `next.txt`
 - disqualified by the leader via 'disqualify' in `next.txt`, e.g. models that do more than one step (leader's judgement)
 - keep track of disqualified models in `runner.json` (see Runner state)
     - disqualified models are excluded from `team.txt` and from leader selection
@@ -145,6 +151,7 @@
 
 # Process control
 - Ctrl+C: terminate the Pi process group, log "interrupted", no disqualification, exit 130
+- SIGTERM and SIGHUP are handled the same way, exit 128 + signal number (143, 129)
 - `runner.lock` in the current working directory prevents a second runner there; removed on exit
 - exit codes: 0 stop, 1 error, 2 usage error, 3 time limit reached, 4 failure stop (see below)
 
